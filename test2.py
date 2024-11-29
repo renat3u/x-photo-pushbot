@@ -4,8 +4,8 @@ from twitter.scraper import Scraper
 length = 5  # 可以修改为你想要提取的数量
 
 scraper = Scraper(cookies={
-    "ct0": '6818ada1faa590a7f7ae5a602d9e41dcab599a2759f0f69c1d354feb7c027c227a1a2b68ba6a6735c9005334eb20fd696ff0c0299d43e225c40cacc1bc74711316c8ffd67129868f197a2304bf7e334d',
-    "auth_token": '348afbe69508f67eb0f62382916222e4555d98e5'
+    "ct0": '',
+    "auth_token": ''
 })
 
 likes = scraper.likes([1288320315341148160])

@@ -6,10 +6,6 @@ import tweepy
 from twitter_api_client import Client
 
 # 设置API凭证
-API_KEY = 'Li3c6CA5Ya8m0Z5igLmwOL3xx'
-API_SECRET_KEY = 'AvrfNyxrUdQQByHb3e6HQ7AfR2hTDiO1iQe9rN2rcI5QnRsR3k'
-ACCESS_TOKEN = '1288320315341148160-jlenyR0wDz4LTMIRjtkikpvDKodDmb'
-ACCESS_TOKEN_SECRET = '0BsrpW1Xize9FYIot0YvUERRyftye0J7AZ7wEEqjicULr'
 
 auth = OAuth1(API_KEY, API_SECRET_KEY, ACCESS_TOKEN, ACCESS_TOKEN_SECRET)
 
