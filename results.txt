@@ -1,4 +1,0 @@
-conversation_id_str: 1280064059287629825
-expanded_url: https://x.com/bunko_dengeki/status/1280064059287629825/photo/1
-media_url_https: https://pbs.twimg.com/media/EcOzectU0AEhrF2.jpg
-
