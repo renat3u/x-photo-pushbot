@@ -1,2 +1,2 @@
-python_twitter==3.5
+twitter-api-clientr==0.10.22
 Requests==2.32.3
