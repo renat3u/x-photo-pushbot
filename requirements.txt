@@ -1,2 +1,2 @@
-twitter-api-clientr==0.10.22
+twitter-api-client==0.10.22
 Requests==2.32.3
