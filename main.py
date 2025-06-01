@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import time
+import hashlib
 from twitter.scraper import Scraper
 import requests
 
@@ -24,48 +25,22 @@ def load_saved_data(file_path):
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             return json.load(file)
-    except FileNotFoundError:
-        print(f"File {file_path} not found. Returning empty list.")
-        return []
-    except json.JSONDecodeError:
-        print(f"Error decoding JSON from file {file_path}. Returning empty list.")
+    except (FileNotFoundError, json.JSONDecodeError):
         return []
 
+def hash_item(item):
+    raw = f"{item['id']}|{item['media_url']}"
+    return hashlib.md5(raw.encode()).hexdigest()
 
-def get_differences(data, saved_data):
-    data = data.get("data", [])
-    saved_data = saved_data.get("data", [])
+def get_differences(new_data, saved_data):
+    new_hashes = {hash_item(item): item for item in new_data}
+    old_hashes = {hash_item(item): item for item in saved_data}
 
-    data_ids = {
-        item[0]
-        for item in data
-        if isinstance(item, list) and len(item) > 0 and isinstance(item[0], str)
-    }
-    saved_data_ids = {
-        item[0]
-        for item in saved_data
-        if isinstance(item, list) and len(item) > 0 and isinstance(item[0], str)
-    }
-
-    differences_ids = data_ids.symmetric_difference(saved_data_ids)
-
-    differences = [
-        item
-        for item in data
-        if isinstance(item, list) and len(item) > 0 and item[0] in differences_ids
-    ]
-    differences.extend(
-        [
-            item
-            for item in saved_data
-            if isinstance(item, list) and len(item) > 0 and item[0] in differences_ids
-        ]
-    )
-
-    return differences
-
+    new_only = [item for h, item in new_hashes.items() if h not in old_hashes]
+    return new_only
 
 def get_liked_tweets():
+    media_items = []
     likes = scraper.likes([userid])
     for like in likes:
         if (
@@ -82,85 +57,87 @@ def get_liked_tweets():
                 for instruction in timeline["instructions"]:
                     if "entries" in instruction:
                         for entry in instruction["entries"]:
-                            if "content" in entry:
-                                tweet = (
-                                    entry["content"]
-                                    .get("itemContent", {})
-                                    .get("tweet_results", {})
-                                    .get("result", {})
-                                )
-                                if "legacy" in tweet:
-                                    conversation_id_str = tweet["legacy"].get(
-                                        "conversation_id_str"
-                                    )
-                                    entities = tweet["legacy"].get("entities", {})
+                            tweet = (
+                                entry.get("content", {})
+                                .get("itemContent", {})
+                                .get("tweet_results", {})
+                                .get("result", {})
+                            )
+                            legacy = tweet.get("legacy", {})
+                            tweet_id = legacy.get("conversation_id_str")
+                            tweet_url = f"https://twitter.com/i/web/status/{tweet_id}"
+                            media_list = legacy.get("entities", {}).get("media", [])
+                            for media in media_list:
+                                media_url = media.get("media_url_https")
+                                if tweet_id and media_url:
+                                    media_items.append({
+                                        "id": tweet_id,
+                                        "media_url": media_url,
+                                        "tweet_url": tweet_url
+                                    })
+    return media_items
 
-                                    for media in entities.get("media", []):
-                                        expanded_url = media.get("expanded_url")
-                                        media_url_https = media.get("media_url_https")
-                                        if expanded_url and media_url_https:
-                                            media_urls.append(
-                                                [
-                                                    conversation_id_str,
-                                                    expanded_url,
-                                                    media_url_https,
-                                                ]
-                                            )
+def push(data):
+    count = 0
+    for item in data:
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{bottoken}/sendPhoto",
+                data={
+                    "chat_id": chatid,
+                    "caption": item["tweet_url"],
+                    "photo": item["media_url"]
+                }
+            )
+            if response.status_code == 200:
+                print(f"推送成功: {item['tweet_url']}")
+            else:
+                print(f"推送失败 ({response.status_code}): {item['tweet_url']}")
+        except requests.RequestException as e:
+            print(f"请求异常：{e} - {item['tweet_url']}")
 
-    return media_urls
+        count += 1
+        if count % 20 == 0:
+            print("已推送20条，暂停30秒...")
+            time.sleep(30)
 
-
-def push(json_data):
-    for item in json_data:
-        if isinstance(item, list) and len(item) >= 3:
-            tweeturl = item[1]
-            photourl = item[2]
-            if tweeturl and photourl:
-                push = requests.post(
-                    f"https://api.telegram.org/bot{bottoken}/sendPhoto",
-                    data={"chat_id": chatid, "caption": tweeturl, "photo": photourl},
-                )
-
-                if push.status_code == 200:
-                    print("推送成功")
-                else:
-                    print("推送失败")
-
+def safe_remove_dir(path):
+    if os.path.exists(path) and os.path.isdir(path):
+        try:
+            shutil.rmtree(path)
+        except Exception as e:
+            print(f"无法删除目录 {path}: {e}")
 
 def main():
     file_path = "pre_results.json"
     saved_data = load_saved_data(file_path)
-    if saved_data == []:
-        print("数组为空，将初始化，不执行其他操作")
-        media_urls = get_liked_tweets()
-        data = {"data": media_urls}
-        with open(file_path, "w") as f:
-            json.dump(data, f, indent=4)
-        print(f"提取了 {len(media_urls)} 条媒体信息，并已写入到 pre_results.json 文件")
-        exit()
 
-    media_urls = get_liked_tweets()
-    data = {"data": media_urls}
-    differences = get_differences(data, saved_data)
-    if differences == []:
-        print("无变化，无需推送")
+    media_items = get_liked_tweets()
+    media_items = sorted(media_items, key=lambda x: (x["id"], x["media_url"]))
+
+    if not saved_data:
+        print("首次运行，初始化数据...")
+        with open(file_path, "w", encoding="utf-8") as f:
+            json.dump(media_items, f, indent=4, ensure_ascii=False)
+        print(f"已保存 {len(media_items)} 条数据。")
+        return
+
+    differences = get_differences(media_items, saved_data)
+    if not differences:
+        print("无新内容，无需推送。")
     else:
+        print(f"发现 {len(differences)} 条新内容，开始推送...")
         push(differences)
 
-    if os.path.exists("./data"):
-        shutil.rmtree("./data")
-
-    data = {"data": media_urls}
-    with open(file_path, "w") as f:
-        json.dump(data, f, indent=4)
-        print(f"提取了 {len(media_urls)} 条媒体信息，并已写入到 pre_results.json 文件")
-
+    safe_remove_dir("./data")
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(media_items, f, indent=4, ensure_ascii=False)
+        print(f"当前媒体信息已更新，共 {len(media_items)} 条。")
 
 def run():
     while True:
         main()
         time.sleep(sleeptime)
-
 
 if __name__ == "__main__":
     run()
