@@ -39,6 +39,12 @@ def get_differences(new_data, saved_data):
     new_only = [item for h, item in new_hashes.items() if h not in old_hashes]
     return new_only
 
+def merge_items(existing_data, new_data):
+    merged = {hash_item(item): item for item in existing_data}
+    for item in new_data:
+        merged[hash_item(item)] = item
+    return sorted(merged.values(), key=lambda x: (x["id"], x["media_url"]))
+
 def get_liked_tweets():
     media_items = []
     likes = scraper.likes([userid])
@@ -129,10 +135,12 @@ def main():
         print(f"发现 {len(differences)} 条新内容，开始推送...")
         push(differences)
 
+    merged_data = merge_items(saved_data, media_items)
+
     safe_remove_dir("./data")
     with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(media_items, f, indent=4, ensure_ascii=False)
-        print(f"当前媒体信息已更新，共 {len(media_items)} 条。")
+        json.dump(merged_data, f, indent=4, ensure_ascii=False)
+        print(f"当前媒体信息已更新，共 {len(merged_data)} 条。")
 
 def run():
     while True:
