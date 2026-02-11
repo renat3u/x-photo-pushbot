@@ -95,6 +95,12 @@ def get_differences(new_data, pushed_hashes):
     return new_items
 
 
+def merge_items(existing_data, new_data):
+    merged = {hash_item(item): item for item in existing_data}
+    for item in new_data:
+        merged[hash_item(item)] = item
+    return sorted(merged.values(), key=lambda x: (x["id"], x["media_url"]))
+
 def get_liked_tweets():
     media_items = []
     likes = scraper.likes([userid])
@@ -198,6 +204,8 @@ def main():
 
     state["pushed_hashes"] = sorted(pushed_hashes)
     state["last_items"] = media_items
+
+    merged_data = merge_items(saved_data, media_items)
 
     safe_remove_dir("./data")
     save_state(file_path, state)
