@@ -1,25 +1,30 @@
 import json
 import os
-import shutil
 import time
 import hashlib
-from twitter.scraper import Scraper
+
 import requests
+
+from twitter_likes import TwitterLikesClient
 
 
 userid = 114514
-bottoken = "114514:ABCDEFG"
-chatid = "***REMOVED***"
+bottoken = "114514:ACBD"
+chatid = "-114514"
 sleeptime = 86400
-media_urls = []
-STATE_VERSION = 2
+cookies = {
+    "ct0": "114514",
+    "auth_token": "114514",
+}
 
-scraper = Scraper(
-    cookies={
-        "ct0": "1145",
-        "auth_token": "14",
-    }
-)
+max_like_pages = 5
+like_page_size = 40
+
+STATE_VERSION = 3
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(BASE_DIR, "pre_results.json")
+
+likes_client = TwitterLikesClient(cookies)
 
 
 def hash_item(item):
@@ -30,30 +35,37 @@ def hash_item(item):
 def normalize_items(items):
     unique_items = {}
     for item in items:
+        if not isinstance(item, dict):
+            continue
+        if not all(
+            isinstance(item.get(field), str) and item[field]
+            for field in ("id", "media_url", "tweet_url")
+        ):
+            continue
         item_hash = hash_item(item)
         unique_items[item_hash] = item
     return sorted(unique_items.values(), key=lambda x: (x["id"], x["media_url"]))
 
 
 def load_saved_data(file_path):
-    """
-    支持两种格式：
-    1) 旧版: [ {id, media_url, tweet_url}, ... ]
-    2) 新版: {"version": 2, "pushed_hashes": [...], "last_items": [...]}
-    """
-    default_state = {"version": STATE_VERSION, "pushed_hashes": [], "last_items": []}
+    default_state = {
+        "version": STATE_VERSION,
+        "initialized": False,
+        "pushed_hashes": [],
+        "last_items": [],
+    }
 
     try:
         with open(file_path, "r", encoding="utf-8") as file:
             raw = json.load(file)
     except (FileNotFoundError, json.JSONDecodeError):
         return default_state
-
-    # 兼容旧版列表结构
+    
     if isinstance(raw, list):
         items = normalize_items(raw)
         return {
             "version": STATE_VERSION,
+            "initialized": bool(items),
             "pushed_hashes": sorted({hash_item(item) for item in items}),
             "last_items": items,
         }
@@ -69,7 +81,10 @@ def load_saved_data(file_path):
 
         return {
             "version": STATE_VERSION,
-            "pushed_hashes": sorted(set(pushed_hashes)),
+            "initialized": bool(raw.get("initialized", pushed_hashes or last_items)),
+            "pushed_hashes": sorted(
+                {value for value in pushed_hashes if isinstance(value, str)}
+            ),
             "last_items": normalize_items(last_items),
         }
 
@@ -79,11 +94,22 @@ def load_saved_data(file_path):
 def save_state(file_path, state):
     safe_state = {
         "version": STATE_VERSION,
-        "pushed_hashes": sorted(set(state.get("pushed_hashes", []))),
+        "initialized": bool(state.get("initialized", False)),
+        "pushed_hashes": sorted(
+            {
+                value
+                for value in state.get("pushed_hashes", [])
+                if isinstance(value, str)
+            }
+        ),
         "last_items": normalize_items(state.get("last_items", [])),
     }
-    with open(file_path, "w", encoding="utf-8") as f:
-        json.dump(safe_state, f, indent=4, ensure_ascii=False)
+    temp_path = f"{file_path}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(safe_state, file, indent=4, ensure_ascii=False)
+        file.flush()
+        os.fsync(file.fileno())
+    os.replace(temp_path, file_path)
 
 
 def get_differences(new_data, pushed_hashes):
@@ -95,99 +121,59 @@ def get_differences(new_data, pushed_hashes):
     return new_items
 
 
-def merge_items(existing_data, new_data):
-    merged = {hash_item(item): item for item in existing_data}
-    for item in new_data:
-        merged[hash_item(item)] = item
-    return sorted(merged.values(), key=lambda x: (x["id"], x["media_url"]))
-
-def get_liked_tweets():
-    media_items = []
-    likes = scraper.likes([userid])
-    for like in likes:
-        if (
-            "data" in like
-            and "user" in like["data"]
-            and "result" in like["data"]["user"]
-        ):
-            timeline = (
-                like["data"]["user"]["result"]
-                .get("timeline_v2", {})
-                .get("timeline", {})
-            )
-            if "instructions" in timeline:
-                for instruction in timeline["instructions"]:
-                    if "entries" in instruction:
-                        for entry in instruction["entries"]:
-                            tweet = (
-                                entry.get("content", {})
-                                .get("itemContent", {})
-                                .get("tweet_results", {})
-                                .get("result", {})
-                            )
-                            legacy = tweet.get("legacy", {})
-                            tweet_id = legacy.get("conversation_id_str")
-                            tweet_url = f"https://twitter.com/i/web/status/{tweet_id}"
-                            media_list = legacy.get("entities", {}).get("media", [])
-                            for media in media_list:
-                                media_url = media.get("media_url_https")
-                                if tweet_id and media_url:
-                                    media_items.append({
-                                        "id": tweet_id,
-                                        "media_url": media_url,
-                                        "tweet_url": tweet_url
-                                    })
-    return normalize_items(media_items)
-
-
 def push(data):
-    count = 0
     success_hashes = []
 
-    for item in data:
+    for count, item in enumerate(data, start=1):
         try:
             response = requests.post(
                 f"https://api.telegram.org/bot{bottoken}/sendPhoto",
                 data={
                     "chat_id": chatid,
                     "caption": item["tweet_url"],
-                    "photo": item["media_url"]
-                }
+                    "photo": item["media_url"],
+                },
+                timeout=(10, 30),
             )
-            if response.status_code == 200:
+            response_data = response.json()
+            if (
+                response.status_code == 200
+                and isinstance(response_data, dict)
+                and response_data.get("ok") is True
+            ):
                 print(f"推送成功: {item['tweet_url']}")
                 success_hashes.append(hash_item(item))
             else:
                 print(f"推送失败 ({response.status_code}): {item['tweet_url']}")
-        except requests.RequestException as e:
+        except (requests.RequestException, ValueError, TypeError) as e:
             print(f"请求异常：{e} - {item['tweet_url']}")
 
-        count += 1
-        if count % 20 == 0:
+        if count % 20 == 0 and count < len(data):
             print("已推送20条，暂停30秒...")
             time.sleep(30)
 
     return success_hashes
 
 
-def safe_remove_dir(path):
-    if os.path.exists(path) and os.path.isdir(path):
-        try:
-            shutil.rmtree(path)
-        except Exception as e:
-            print(f"无法删除目录 {path}: {e}")
-
-
 def main():
-    file_path = "pre_results.json"
-    state = load_saved_data(file_path)
+    state = load_saved_data(STATE_FILE)
+    is_first_run = not state.get("initialized", False)
 
     print("开始获取喜欢的帖子...")
-    media_items = get_liked_tweets()
+    media_items = normalize_items(
+        likes_client.get_liked_media(
+            userid,
+            max_pages=max_like_pages,
+            page_size=like_page_size,
+        )
+    )
+    for warning in likes_client.last_warnings:
+        print(f"X Likes 警告: {warning}")
+    if is_first_run and likes_client.last_warnings:
+        raise RuntimeError("首次初始化获取不完整，本轮不写入状态，请稍后重试")
     print(f"获取完成，本次共 {len(media_items)} 条媒体记录。")
 
     pushed_hashes = set(state.get("pushed_hashes", []))
-    is_first_run = len(pushed_hashes) == 0
 
     if is_first_run:
         print("首次运行，初始化去重状态，不推送历史内容。")
@@ -204,17 +190,19 @@ def main():
 
     state["pushed_hashes"] = sorted(pushed_hashes)
     state["last_items"] = media_items
+    state["initialized"] = True
 
-    merged_data = merge_items(saved_data, media_items)
-
-    safe_remove_dir("./data")
-    save_state(file_path, state)
+    save_state(STATE_FILE, state)
     print(f"状态已更新：累计去重指纹 {len(state['pushed_hashes'])} 条。")
 
 
 def run():
     while True:
-        main()
+        try:
+            main()
+        except Exception as error:
+            print(f"本轮执行失败：{error}")
+        print(f"等待 {sleeptime} 秒后执行下一轮。")
         time.sleep(sleeptime)
 
 
