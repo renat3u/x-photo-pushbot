@@ -1,7 +1,10 @@
+import hashlib
+import itertools
 import json
+import logging
+import logging.handlers
 import os
 import time
-import hashlib
 
 import requests
 
@@ -24,6 +27,17 @@ STATE_VERSION = 3
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(BASE_DIR, "pre_results.json")
 
+PUSH_BATCH_SIZE = 20
+PUSH_BATCH_SLEEP = 30
+
+TELEGRAM_ALBUM_MAX = 10
+
+LOG_FILE = os.path.join(BASE_DIR, "main.log")
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_BACKUP_COUNT = 7
+
+logger = logging.getLogger("main")
+
 likes_client = TwitterLikesClient(cookies)
 
 
@@ -45,6 +59,28 @@ def normalize_items(items):
         item_hash = hash_item(item)
         unique_items[item_hash] = item
     return sorted(unique_items.values(), key=lambda x: (x["id"], x["media_url"]))
+
+
+def setup_logging():
+    if logger.handlers:
+        return logger
+    logger.setLevel(logging.INFO)
+    formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
+
+    file_handler = logging.handlers.RotatingFileHandler(
+        LOG_FILE,
+        maxBytes=LOG_MAX_BYTES,
+        backupCount=LOG_BACKUP_COUNT,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(formatter)
+
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
 
 
 def load_saved_data(file_path):
@@ -121,17 +157,48 @@ def get_differences(new_data, pushed_hashes):
     return new_items
 
 
-def push(data):
-    success_hashes = []
+def _send_photo(item):
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{bottoken}/sendPhoto",
+            data={
+                "chat_id": chatid,
+                "caption": item["tweet_url"],
+                "photo": item["media_url"],
+            },
+            timeout=(10, 30),
+        )
+        response_data = response.json()
+        if (
+            response.status_code == 200
+            and isinstance(response_data, dict)
+            and response_data.get("ok") is True
+        ):
+            logger.info(f"推送成功: {item['tweet_url']}")
+            return [item]
+        logger.warning(f"推送失败 ({response.status_code}): {item['tweet_url']}")
+    except (requests.RequestException, ValueError, TypeError) as error:
+        logger.error(f"请求异常：{error} - {item['tweet_url']}")
+    return []
 
-    for count, item in enumerate(data, start=1):
+
+def _send_media_group(group):
+    sent_items = []
+    for start in range(0, len(group), TELEGRAM_ALBUM_MAX):
+        chunk = group[start : start + TELEGRAM_ALBUM_MAX]
+        if len(chunk) == 1:
+            sent_items.extend(_send_photo(chunk[0]))
+            continue
+        media = [
+            {"type": "photo", "media": item["media_url"]} for item in chunk
+        ]
+        media[0]["caption"] = chunk[0]["tweet_url"]
         try:
             response = requests.post(
-                f"https://api.telegram.org/bot{bottoken}/sendPhoto",
+                f"https://api.telegram.org/bot{bottoken}/sendMediaGroup",
                 data={
                     "chat_id": chatid,
-                    "caption": item["tweet_url"],
-                    "photo": item["media_url"],
+                    "media": json.dumps(media),
                 },
                 timeout=(10, 30),
             )
@@ -141,16 +208,36 @@ def push(data):
                 and isinstance(response_data, dict)
                 and response_data.get("ok") is True
             ):
-                print(f"推送成功: {item['tweet_url']}")
-                success_hashes.append(hash_item(item))
+                logger.info(
+                    f"相册推送成功: {chunk[0]['tweet_url']}（{len(chunk)} 张）"
+                )
+                sent_items.extend(chunk)
             else:
-                print(f"推送失败 ({response.status_code}): {item['tweet_url']}")
-        except (requests.RequestException, ValueError, TypeError) as e:
-            print(f"请求异常：{e} - {item['tweet_url']}")
+                logger.warning(
+                    f"相册推送失败 ({response.status_code}): {chunk[0]['tweet_url']}"
+                )
+        except (requests.RequestException, ValueError, TypeError) as error:
+            logger.error(f"相册请求异常：{error} - {chunk[0]['tweet_url']}")
+    return sent_items
 
-        if count % 20 == 0 and count < len(data):
-            print("已推送20条，暂停30秒...")
-            time.sleep(30)
+
+def push(data):
+    success_hashes = []
+    processed = 0
+    total = len(data)
+
+    for _, group in itertools.groupby(data, key=lambda item: item["id"]):
+        group = list(group)
+        if len(group) == 1:
+            sent_items = _send_photo(group[0])
+        else:
+            sent_items = _send_media_group(group)
+        success_hashes.extend(hash_item(item) for item in sent_items)
+
+        processed += len(group)
+        if processed % PUSH_BATCH_SIZE == 0 and processed < total:
+            logger.info(f"已推送 {processed} 条，暂停 {PUSH_BATCH_SLEEP} 秒...")
+            time.sleep(PUSH_BATCH_SLEEP)
 
     return success_hashes
 
@@ -159,7 +246,7 @@ def main():
     state = load_saved_data(STATE_FILE)
     is_first_run = not state.get("initialized", False)
 
-    print("开始获取喜欢的帖子...")
+    logger.info("开始获取喜欢的帖子...")
     media_items = normalize_items(
         likes_client.get_liked_media(
             userid,
@@ -168,43 +255,49 @@ def main():
         )
     )
     for warning in likes_client.last_warnings:
-        print(f"X Likes 警告: {warning}")
+        logger.warning(f"X Likes 警告: {warning}")
     if is_first_run and likes_client.last_warnings:
         raise RuntimeError("首次初始化获取不完整，本轮不写入状态，请稍后重试")
-    print(f"获取完成，本次共 {len(media_items)} 条媒体记录。")
+    logger.info(f"获取完成，本次共 {len(media_items)} 条媒体记录。")
 
     pushed_hashes = set(state.get("pushed_hashes", []))
 
     if is_first_run:
-        print("首次运行，初始化去重状态，不推送历史内容。")
+        logger.info("首次运行，初始化去重状态，不推送历史内容。")
         pushed_hashes.update(hash_item(item) for item in media_items)
     else:
         differences = get_differences(media_items, pushed_hashes)
         if not differences:
-            print("无新内容，无需推送。")
+            logger.info("无新内容，无需推送。")
         else:
-            print(f"发现 {len(differences)} 条新内容，开始推送...")
+            logger.info(f"发现 {len(differences)} 条新内容，开始推送...")
             success_hashes = push(differences)
             pushed_hashes.update(success_hashes)
-            print(f"本轮推送成功 {len(success_hashes)} 条。")
+            logger.info(f"本轮推送成功 {len(success_hashes)} 条。")
 
     state["pushed_hashes"] = sorted(pushed_hashes)
     state["last_items"] = media_items
     state["initialized"] = True
 
     save_state(STATE_FILE, state)
-    print(f"状态已更新：累计去重指纹 {len(state['pushed_hashes'])} 条。")
+    logger.info(f"状态已更新：累计去重指纹 {len(state['pushed_hashes'])} 条。")
 
 
 def run():
+    logger.info("推送服务启动。")
     while True:
+        round_start = time.time()
         try:
             main()
         except Exception as error:
-            print(f"本轮执行失败：{error}")
-        print(f"等待 {sleeptime} 秒后执行下一轮。")
+            logger.exception(f"本轮执行失败：{error}")
+        logger.info(
+            f"本轮耗时 {time.time() - round_start:.1f} 秒，"
+            f"等待 {sleeptime} 秒后执行下一轮。"
+        )
         time.sleep(sleeptime)
 
 
 if __name__ == "__main__":
+    setup_logging()
     run()
