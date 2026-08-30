@@ -1,6 +1,6 @@
 import json
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 import requests
@@ -319,7 +319,14 @@ class TwitterLikesClient:
         *,
         max_pages: int | None = None,
         page_size: int = 40,
+        should_stop: Callable[[list[dict[str, str]]], bool] | None = None,
     ) -> list[dict[str, str]]:
+        """抓取点赞媒体；should_stop 在每页抓取后收到该页媒体，返回 True 则提前停止翻页。
+
+        should_stop 用于"整页都是已推送内容时提前停止"：点赞时间线按时间倒序，
+        一旦某页不再产生新内容，更旧的页面也不会有新内容。空页（纯文字点赞）
+        不会触发停止，仅多花一次请求。
+        """
         if max_pages is not None and max_pages < 1:
             raise ValueError("max_pages 必须大于 0 或为 None")
         if not 1 <= page_size <= 100:
@@ -341,6 +348,9 @@ class TwitterLikesClient:
                 )
                 break
             pages.append(page)
+
+            if should_stop is not None and should_stop(extract_liked_media([page])):
+                break
 
             next_cursor = _get_bottom_cursor(page)
             if not next_cursor or next_cursor in seen_cursors:

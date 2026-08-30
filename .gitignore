@@ -1,0 +1,12 @@
+# 运行时产物
+pre_results.json
+main.log
+*.log.tmp
+
+# Python
+__pycache__/
+*.pyc
+
+# 本地配置与密钥（如后续改为配置文件）
+*.secret
+.env

@@ -31,6 +31,9 @@ PUSH_BATCH_SIZE = 20
 PUSH_BATCH_SLEEP = 30
 
 TELEGRAM_ALBUM_MAX = 10
+TELEGRAM_API_RETRIES = 3
+TELEGRAM_RETRY_BASE_DELAY = 2
+TELEGRAM_MAX_RETRY_DELAY = 60
 
 LOG_FILE = os.path.join(BASE_DIR, "main.log")
 LOG_MAX_BYTES = 5 * 1024 * 1024
@@ -39,6 +42,7 @@ LOG_BACKUP_COUNT = 7
 logger = logging.getLogger("main")
 
 likes_client = TwitterLikesClient(cookies)
+telegram_session = requests.Session()
 
 
 def hash_item(item):
@@ -157,28 +161,93 @@ def get_differences(new_data, pushed_hashes):
     return new_items
 
 
-def _send_photo(item):
-    try:
-        response = requests.post(
-            f"https://api.telegram.org/bot{bottoken}/sendPhoto",
-            data={
-                "chat_id": chatid,
-                "caption": item["tweet_url"],
-                "photo": item["media_url"],
-            },
-            timeout=(10, 30),
-        )
-        response_data = response.json()
+def _telegram_request(endpoint, data):
+    """带重试地调用 Telegram Bot API；成功返回响应 JSON，最终失败返回 None。
+
+    网络异常、5xx、429 会重试；429 优先按响应里的 retry_after 等待。
+    4xx（如图片 URL 超 5MB、媒体格式错误）属于确定性失败，不重试。
+    """
+    for attempt in range(TELEGRAM_API_RETRIES + 1):
+        response = None
+        response_data = None
+        try:
+            response = telegram_session.post(
+                f"https://api.telegram.org/bot{bottoken}/{endpoint}",
+                data=data,
+                timeout=(10, 30),
+            )
+            response_data = response.json()
+        except (requests.RequestException, ValueError, TypeError) as error:
+            if attempt < TELEGRAM_API_RETRIES:
+                delay = min(
+                    TELEGRAM_RETRY_BASE_DELAY * 2**attempt,
+                    TELEGRAM_MAX_RETRY_DELAY,
+                )
+                logger.warning(
+                    f"Telegram 请求异常，{delay} 秒后重试"
+                    f"（第 {attempt + 1}/{TELEGRAM_API_RETRIES} 次）: {error}"
+                )
+                time.sleep(delay)
+                continue
+            logger.error(f"Telegram 请求异常，已达最大重试次数: {error}")
+            return None
+
         if (
             response.status_code == 200
             and isinstance(response_data, dict)
             and response_data.get("ok") is True
         ):
-            logger.info(f"推送成功: {item['tweet_url']}")
-            return [item]
-        logger.warning(f"推送失败 ({response.status_code}): {item['tweet_url']}")
-    except (requests.RequestException, ValueError, TypeError) as error:
-        logger.error(f"请求异常：{error} - {item['tweet_url']}")
+            return response_data
+
+        if attempt < TELEGRAM_API_RETRIES and (
+            response.status_code == 429 or response.status_code >= 500
+        ):
+            delay = min(
+                TELEGRAM_RETRY_BASE_DELAY * 2**attempt,
+                TELEGRAM_MAX_RETRY_DELAY,
+            )
+            if response.status_code == 429 and isinstance(response_data, dict):
+                parameters = response_data.get("parameters")
+                retry_after = (
+                    parameters.get("retry_after")
+                    if isinstance(parameters, dict)
+                    else None
+                )
+                if isinstance(retry_after, (int, float)) and 0 < retry_after:
+                    delay = min(int(retry_after) + 1, TELEGRAM_MAX_RETRY_DELAY)
+            logger.warning(
+                f"Telegram 接口返回 {response.status_code}，{delay} 秒后重试"
+                f"（第 {attempt + 1}/{TELEGRAM_API_RETRIES} 次）"
+            )
+            time.sleep(delay)
+            continue
+
+        description = (
+            response_data.get("description", "")
+            if isinstance(response_data, dict)
+            else ""
+        )
+        logger.warning(
+            f"Telegram 接口返回 {response.status_code}: {description}"
+        )
+        return None
+
+    return None
+
+
+def _send_photo(item):
+    response_data = _telegram_request(
+        "sendPhoto",
+        {
+            "chat_id": chatid,
+            "caption": item["tweet_url"],
+            "photo": item["media_url"],
+        },
+    )
+    if response_data is not None:
+        logger.info(f"推送成功: {item['tweet_url']}")
+        return [item]
+    logger.warning(f"推送失败: {item['tweet_url']}")
     return []
 
 
@@ -193,31 +262,20 @@ def _send_media_group(group):
             {"type": "photo", "media": item["media_url"]} for item in chunk
         ]
         media[0]["caption"] = chunk[0]["tweet_url"]
-        try:
-            response = requests.post(
-                f"https://api.telegram.org/bot{bottoken}/sendMediaGroup",
-                data={
-                    "chat_id": chatid,
-                    "media": json.dumps(media),
-                },
-                timeout=(10, 30),
+        response_data = _telegram_request(
+            "sendMediaGroup",
+            {
+                "chat_id": chatid,
+                "media": json.dumps(media),
+            },
+        )
+        if response_data is not None:
+            logger.info(
+                f"相册推送成功: {chunk[0]['tweet_url']}（{len(chunk)} 张）"
             )
-            response_data = response.json()
-            if (
-                response.status_code == 200
-                and isinstance(response_data, dict)
-                and response_data.get("ok") is True
-            ):
-                logger.info(
-                    f"相册推送成功: {chunk[0]['tweet_url']}（{len(chunk)} 张）"
-                )
-                sent_items.extend(chunk)
-            else:
-                logger.warning(
-                    f"相册推送失败 ({response.status_code}): {chunk[0]['tweet_url']}"
-                )
-        except (requests.RequestException, ValueError, TypeError) as error:
-            logger.error(f"相册请求异常：{error} - {chunk[0]['tweet_url']}")
+            sent_items.extend(chunk)
+        else:
+            logger.warning(f"相册推送失败: {chunk[0]['tweet_url']}")
     return sent_items
 
 
@@ -245,6 +303,12 @@ def push(data):
 def main():
     state = load_saved_data(STATE_FILE)
     is_first_run = not state.get("initialized", False)
+    pushed_hashes = set(state.get("pushed_hashes", []))
+
+    def stop_when_all_pushed(page_items):
+        return bool(page_items) and all(
+            hash_item(item) in pushed_hashes for item in page_items
+        )
 
     logger.info("开始获取喜欢的帖子...")
     media_items = normalize_items(
@@ -252,6 +316,7 @@ def main():
             userid,
             max_pages=max_like_pages,
             page_size=like_page_size,
+            should_stop=stop_when_all_pushed,
         )
     )
     for warning in likes_client.last_warnings:
@@ -259,8 +324,6 @@ def main():
     if is_first_run and likes_client.last_warnings:
         raise RuntimeError("首次初始化获取不完整，本轮不写入状态，请稍后重试")
     logger.info(f"获取完成，本次共 {len(media_items)} 条媒体记录。")
-
-    pushed_hashes = set(state.get("pushed_hashes", []))
 
     if is_first_run:
         logger.info("首次运行，初始化去重状态，不推送历史内容。")
